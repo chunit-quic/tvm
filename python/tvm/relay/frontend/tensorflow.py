@@ -161,6 +161,40 @@ def rewrite_subgraph(expr, rewrites):
     """Rewrite loop body."""
     return RewriteSubgraph(rewrites).visit(expr)
 
+def fill_up_span(expr, span):
+    """Fill the span for those one to many conversion"""
+
+    class SpanFiller(ExprMutator):
+        """SpanFiller"""
+
+        def __init__(self, span, surfix_str="_DERIVED_"):
+            ExprMutator.__init__(self)
+            self.span_node_name = span.source_name.name
+            self.surfix_str = surfix_str
+            self.counter = 0
+
+        def visit_call(self, call):
+            if call.span == None:
+                node_name = "{}{}{}".format(self.span_node_name, self.surfix_str, str(self.counter))
+                self.counter += 1
+                call.span = tvm.relay.Span(tvm.relay.SourceName(node_name), 0, 0, 0, 0)
+            return super().visit_call(call)
+
+        def visit_tuple(self, tup):
+            if tup.span == None:
+                node_name = "{}{}{}".format(self.span_node_name, self.surfix_str, str(self.counter))
+                self.counter += 1
+                tup.span = tvm.relay.Span(tvm.relay.SourceName(node_name), 0, 0, 0, 0)
+            return super().visit_tuple(tup)
+
+        def fill(self, expr):
+            self.visit(expr)
+            new_args = [self.visit(arg) for arg in expr.args]
+
+            return tvm.relay.expr.Call(expr.op, new_args, expr.attrs, expr.type_args, expr.span)
+
+    return SpanFiller(span).fill(expr)
+
 
 class Branch:
     """A class contains the components that are used to build up a Relay if
@@ -1037,12 +1071,14 @@ class GraphProto(object):
         span = tvm.relay.Span(tvm.relay.SourceName(node_name), 0, 0, 0, 0)
         if isinstance(sym, _expr.Call) and sym.span is None:
             sym = _expr.Call(sym.op, sym.args, sym.attrs, sym.type_args, span)
+            sym = fill_up_span(sym, span)
         elif isinstance(sym, _expr.TupleWrapper):
             tuple_value = sym.tuple_value
             if isinstance(tuple_value, _expr.Call) and tuple_value.span is None:
                 tuple_value = _expr.Call(
                     tuple_value.op, tuple_value.args, tuple_value.attrs, tuple_value.type_args, span
                 )
+                tuple_value = fill_up_span(tuple_value, span)
                 sym = _expr.TupleWrapper(tuple_value, sym.size)
         return sym
 
