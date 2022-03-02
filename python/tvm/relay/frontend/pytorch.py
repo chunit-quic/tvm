@@ -3340,7 +3340,30 @@ class PyTorchOpConverter:
                     inputs, _get_input_types(op_node, outputs, default_dtype=self.default_dtype)
                 )
                 span_str, empty_counter = self._get_torch_span(op_node, empty_counter)
-                relay_out = set_span(relay_out, span_str)
+
+                if "outputs.5" in node_name or "19" in node_name:
+                    def do_mutate(sym):
+                        class PureMutator(ExprMutator):
+                            def __init__(self):
+                                ExprMutator.__init__(self)
+
+                            def visit_call(self, call):
+                                new_args = [self.visit(arg) for arg in call.args]
+                                return _expr.Call(
+                                    call.op, new_args, call.attrs, call.type_args)
+
+                            def mutate(self, sym):
+                                if isinstance(sym, _expr.TupleWrapper):
+                                    return _expr.TupleWrapper(self.visit(sym.tuple_value), sym.size)
+                                if isinstance(sym, _expr.RelayExpr):
+                                    return self.visit(sym)
+                                return sym
+                        return PureMutator().mutate(sym)
+                    relay_out = do_mutate(relay_out)
+                    # comment line 3345 to 3362 and use pass below can make duplicated exprssions disappear
+                    # pass
+                else:
+                    relay_out = set_span(relay_out, span_str)
 
                 self.record_output_type(relay_out)
 
