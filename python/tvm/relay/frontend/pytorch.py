@@ -3402,6 +3402,23 @@ class PyTorchOpConverter:
                 relay_out = relay_op(
                     inputs, _get_input_types(op_node, outputs, default_dtype=self.default_dtype)
                 )
+
+                def do_mutate(sym):
+                    class PureMutator(ExprMutator):
+                        def __init__(self):
+                            ExprMutator.__init__(self)
+
+                        def mutate(self, sym):
+                            if isinstance(sym, _expr.TupleWrapper):
+                                return _expr.TupleWrapper(self.visit(sym.tuple_value), sym.size)
+                            if isinstance(sym, _expr.RelayExpr):
+                                return self.visit(sym)
+                            return sym
+                    return PureMutator().mutate(sym)
+
+                # comment the following line to get original relay IR
+                relay_out = do_mutate(relay_out)
+
                 self.record_output_type(relay_out)
 
                 if isinstance(relay_out, tuple):
