@@ -269,6 +269,19 @@ IRModule Pass::operator()(IRModule mod, const PassContext& pass_ctx) const {
   return std::move(ret);
 }
 
+Pass GetPass(const String& pass_name) {
+  using tvm::runtime::Registry;
+  const runtime::PackedFunc* f = nullptr;
+  if (pass_name.operator std::string().find("transform.") != std::string::npos) {
+    f = Registry::Get(pass_name);
+  } else if ((f = Registry::Get("transform." + pass_name))) {
+    // pass
+  } else if ((f = Registry::Get("relay._transform." + pass_name))) {
+  }
+  ICHECK(f != nullptr) << "Cannot use " << pass_name << "to create the pass";
+  return (*f)();
+}
+
 /*!
  * \brief Module-level passes are designed to implement global
  * analysis/optimizations, i.e. interprocedural optimizations (IPO), etc. Passes
@@ -356,6 +369,10 @@ IRModule ModulePassNode::operator()(IRModule mod, const PassContext& pass_ctx) c
   VLOG(0) << "Executing module pass with opt level: " << pass_info->opt_level;
   VLOG(1) << "Input module:" << std::endl << PrettyPrint(mod);
 
+  // resolve dependencies
+  for (const auto& it : pass_info->required) {
+    mod = GetPass(it)(std::move(mod), pass_ctx);
+  }
   mod = pass_func(std::move(mod), pass_ctx);
 
   ICHECK(mod.defined()) << "The return value of a module pass must be set.";
@@ -399,19 +416,6 @@ void SequentialNode::ResolveDependency(const IRModule& mod) {
              << "\n";
 }
 
-Pass GetPass(const String& pass_name) {
-  using tvm::runtime::Registry;
-  const runtime::PackedFunc* f = nullptr;
-  if (pass_name.operator std::string().find("transform.") != std::string::npos) {
-    f = Registry::Get(pass_name);
-  } else if ((f = Registry::Get("transform." + pass_name))) {
-    // pass
-  } else if ((f = Registry::Get("relay._transform." + pass_name))) {
-  }
-  ICHECK(f != nullptr) << "Cannot use " << pass_name << "to create the pass";
-  return (*f)();
-}
-
 // TODO(zhiics): we currently only sequentially execute each pass in
 // a Sequential without the consideration of their orders. The phase
 // ordering problem needs to be handled in the future.
@@ -422,10 +426,6 @@ IRModule SequentialNode::operator()(IRModule mod, const PassContext& pass_ctx) c
     if (!pass_ctx.PassEnabled(pass_info)) {
       VLOG(0) << "skipping disabled pass '" << pass_info->name << "'";
       continue;
-    }
-    // resolve dependencies
-    for (const auto& it : pass_info->required) {
-      mod = GetPass(it)(std::move(mod), pass_ctx);
     }
     mod = pass(std::move(mod), pass_ctx);
   }

@@ -76,6 +76,19 @@ class PrimFuncPass : public Pass {
   TVM_DEFINE_OBJECT_REF_METHODS(PrimFuncPass, Pass, PrimFuncPassNode);
 };
 
+Pass GetPass(const String& pass_name) {
+  using tvm::runtime::Registry;
+  const runtime::PackedFunc* f = nullptr;
+  if (pass_name.operator std::string().find("transform.") != std::string::npos) {
+    f = Registry::Get(pass_name);
+  } else if ((f = Registry::Get("transform." + pass_name))) {
+    // pass
+  } else if ((f = Registry::Get("relay._transform." + pass_name))) {
+  }
+  ICHECK(f != nullptr) << "Cannot use " << pass_name << "to create the pass";
+  return (*f)();
+}
+
 PrimFuncPass::PrimFuncPass(
     runtime::TypedPackedFunc<PrimFunc(PrimFunc, IRModule, PassContext)> pass_func,
     PassInfo pass_info) {
@@ -88,6 +101,11 @@ PrimFuncPass::PrimFuncPass(
 // Perform Module -> Module optimizations at the PrimFunc level.
 IRModule PrimFuncPassNode::operator()(IRModule mod, const PassContext& pass_ctx) const {
   ICHECK(mod.defined());
+
+  // resolve dependencies
+  for (const auto& it : pass_info->required) {
+    mod = GetPass(it)(std::move(mod), pass_ctx);
+  }
   std::vector<ObjectRef> deleted_list;
   IRModuleNode* mod_ptr = mod.CopyOnWrite();
   auto* func_dict = mod_ptr->functions.CopyOnWrite();

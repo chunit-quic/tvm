@@ -101,6 +101,19 @@ FunctionPass::FunctionPass(
   data_ = std::move(n);
 }
 
+Pass GetPass(const String& pass_name) {
+  using tvm::runtime::Registry;
+  const runtime::PackedFunc* f = nullptr;
+  if (pass_name.operator std::string().find("transform.") != std::string::npos) {
+    f = Registry::Get(pass_name);
+  } else if ((f = Registry::Get("transform." + pass_name))) {
+    // pass
+  } else if ((f = Registry::Get("relay._transform." + pass_name))) {
+  }
+  ICHECK(f != nullptr) << "Cannot use " << pass_name << "to create the pass";
+  return (*f)();
+}
+
 // Perform Module -> Module optimizations at the Function level.
 IRModule FunctionPassNode::operator()(IRModule mod, const PassContext& pass_ctx) const {
   DiagnosticContext previous = DiagnosticContext::Default(mod);
@@ -124,6 +137,10 @@ IRModule FunctionPassNode::operator()(IRModule mod, const PassContext& pass_ctx)
   VLOG(0) << "Executing function pass with opt level: " << pass_info->opt_level;
   VLOG(1) << "Input module:" << std::endl << PrettyPrint(mod);
 
+  // resolve dependencies
+  for (const auto& it : pass_info->required) {
+    mod = GetPass(it)(std::move(mod), pass_ctx);
+  }
   IRModule updated_mod = mod->ShallowCopy();
 
   std::vector<std::pair<GlobalVar, Function> > updates;
