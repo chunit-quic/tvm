@@ -44,6 +44,7 @@ from .common import infer_shape as _infer_shape
 from .common import infer_value as _infer_value
 from .common import infer_value_simulated as _infer_value_simulated
 from .common import lstm_cell, try_infer_value, unbind, fold_constant
+from .common import set_span
 from .pytorch_utils import is_version_greater_than, getattr_attr_name
 
 __all__ = ["from_pytorch"]
@@ -135,11 +136,13 @@ def _is_int_seq(seq):
 class PyTorchOpConverter:
     """A helper class for holding PyTorch op converters."""
 
-    def __init__(self, prelude, default_dtype):
+    def __init__(self, prelude, default_dtype, use_parser_friendly_name=False):
         self.prelude = prelude
         self.default_dtype = default_dtype
         self.create_convert_map()
         self.types = {}  # map from nodes to (Relay) type annotations
+        self.seen = {}  # map from Relay.(Var / Constant) to span-tagged version
+        self.use_parser_friendly_name = use_parser_friendly_name
 
     # this incrementally infers the type, see the comments on the type visitor
     # above.
@@ -2347,11 +2350,16 @@ class PyTorchOpConverter:
         iou_threshold = inputs[2]
 
         # TVM NMS assumes score > 0
-        scores = scores - _op.min(scores) + _op.const(1.0)
+        # - since there exists multi-comsumers for "scores", "num_boxes"
+        # - invoke set_span here to prevent expr-rewritten occurrs in span-filling stage
+        span = self._get_span_from_parameter(boxes)
+        scores = set_span(scores - _op.min(scores) + _op.const(1.0), span)
 
-        num_boxes = _op.shape_of(scores)
+        num_boxes = set_span(_op.shape_of(scores), span)
         # PyTorch NMS doesn't have score_threshold, so no need to run get_valid_count
-        indices = _op.transform.arange(_op.squeeze(num_boxes), dtype="int32")
+        # - since "arange" op will fill expr into its attribute
+        # - invoke set_span here to prevent expr-rewritten occurrs in span-filling stage
+        indices = _op.transform.arange(set_span(_op.squeeze(num_boxes), span), dtype="int32")
         indices = _op.expand_dims(indices, 0, 1)
 
         # Generate data with shape (1, num_anchors, 5)
@@ -3873,13 +3881,17 @@ class PyTorchOpConverter:
                             actual_shape.append(Any())
                         else:
                             actual_shape.append(dim)
-                    return _expr.var(name, shape=actual_shape, dtype=checked_type.dtype)
+                    expr = _expr.var(name, shape=actual_shape, dtype=checked_type.dtype)
                 else:
-                    return _expr.var(name, type_annotation=checked_type)
+                    expr = _expr.var(name, type_annotation=checked_type)
+                return set_span(expr, val.span) if val.span else expr
             return _expr.var(name)
 
-        loop_iter_var = _expr.var(block_input_names[0], shape=(), dtype=loop_iter_dtype)
-        loop_vars = [get_var(name, val) for name, val in name_val_pairs[1:]]
+        span = self._get_span(loop_node)
+        loop_iter_var = set_span(
+            _expr.var(block_input_names[0], shape=(), dtype=loop_iter_dtype), span=span
+        )
+        loop_vars = set_span([get_var(name, val) for name, val in name_val_pairs[1:]], span=span)
 
         # Add non constant free variables to loop variables to prevent code blow up
         # Without this, if there are two for loops in a row, which often happens
@@ -3902,7 +3914,7 @@ class PyTorchOpConverter:
             prev_output = outputs[name]
             new_loop_var = get_var(name, prev_output)
             prev_outputs[name] = prev_output
-            outputs[name] = new_loop_var
+            outputs[name] = set_span(new_loop_var, span)
             loop_vars.append(new_loop_var)
             init_vals.append(prev_output)
 
@@ -3954,7 +3966,10 @@ class PyTorchOpConverter:
             if operator == "prim::Constant":
                 outputs[node_name] = _get_constant(op_node)
             elif operator == "prim::ListConstruct" and _should_construct_dynamic_list(op_node):
-                outputs[node_name] = self.convert_to_list_adt(inputs)
+                outputs[node_name] = set_span(
+                    self.convert_to_list_adt(inputs),
+                    self._get_span(op_node),
+                )
             elif operator == "prim::ListConstruct":
                 # This assumes that no more elements will be appended to this list
                 # In this case, we keep the Python list
@@ -3971,25 +3986,31 @@ class PyTorchOpConverter:
                             inputs_list.append(inputs[i])
                     return _expr.Tuple(inputs_list)
 
-                outputs[node_name] = _handel_nested_input(inputs)
+                outputs[node_name] = set_span(
+                    _handel_nested_input(inputs),
+                    self._get_span(op_node),
+                )
             elif operator in ["prim::ListUnpack", "prim::TupleUnpack"]:
                 assert len(inputs) == 1
                 if isinstance(inputs[0], (list, _expr.TupleWrapper)):
                     unpacked = inputs[0]
                 else:
-                    unpacked = _unpack_tuple(inputs[0])
+                    unpacked = set_span(
+                        _unpack_tuple(inputs[0]),
+                        self._get_span(op_node),
+                    )
                 outputs.update(zip(_get_output_names(op_node), unpacked))
             elif operator == "prim::prim::RaiseException":
                 logger.warning("raising exceptions is ignored")
                 outputs[node_name] = None
             elif operator == "prim::If":
                 if_out = self.convert_if(op_node, outputs)
-                outputs[node_name] = if_out
+                outputs[node_name] = set_span(if_out, self._get_span(op_node))
             elif operator == "prim::Loop":
                 loop_out = self.convert_loop(op_node, outputs)
                 unpacked_names = _get_output_names(op_node)
                 assert len(loop_out) == len(unpacked_names)
-                outputs.update(zip(unpacked_names, loop_out))
+                outputs.update(zip(unpacked_names, set_span(loop_out, self._get_span(op_node))))
             else:
                 if operator not in self.convert_map:
                     # At this point, the only possible ops that are not in convert_map are
@@ -4004,9 +4025,14 @@ class PyTorchOpConverter:
                 else:
                     relay_op = self.convert_map[operator]
 
+                self._set_parameter_span(op_node, outputs)
                 relay_out = relay_op(
-                    inputs, _get_input_types(op_node, outputs, default_dtype=self.default_dtype)
+                    # since the elements in "outputs" may change due to span-filling process
+                    # we have to call "_get_op_inputs" again rather than use "inputs" directly
+                    _get_op_inputs(op_node, outputs),
+                    _get_input_types(op_node, outputs, default_dtype=self.default_dtype),
                 )
+                relay_out = set_span(relay_out, self._get_span(op_node))
                 self.record_output_type(relay_out)
 
                 if isinstance(relay_out, tuple):
@@ -4019,6 +4045,115 @@ class PyTorchOpConverter:
                     outputs[node_name] = relay_out
 
         return [_wrap_const(outputs[ret_name]) for ret_name in ret_names]
+
+    def _get_span(self, op_node):
+        return "_".join([output.debugName() for output in op_node.outputs()])
+
+    def _set_parameter_span(self, op_node, outputs):
+        """A helper function to rewrite span of parameter."""
+        for name in _get_input_names(op_node):
+            expr = outputs[name]
+            if isinstance(expr, (_expr.Var, _expr.Constant)):
+                if expr in self.seen:
+                    outputs[name] = self.seen[expr]
+                else:
+                    name_sep = "_" if self.use_parser_friendly_name else "."
+                    span = [self._get_span(op_node)]
+                    if isinstance(expr, _expr.Var):
+                        # variable name should have contained node span
+                        # for op with attributes in convert_params stage
+                        # e.g. "torch.batch_norm_5.running_mean"
+                        if expr.name_hint.startswith(span[0]):
+                            span[0] = expr.name_hint
+                        else:
+                            span.append(expr.name_hint)
+                    new_expr = set_span(expr, name_sep.join(span))
+                    self.seen[expr] = new_expr
+                    outputs[name] = new_expr
+
+    def _get_span_from_parameter(self, expr):
+        """A helper function to get source information of graph node from parameter."""
+        if expr.span:
+            name_sep = "_" if self.use_parser_friendly_name else "."
+            source_name = expr.span.source_name.name
+            # discard variable/parameter name to get span of op node
+            # e.g. conv2d.w / conv2d_w -> conv2d
+            if isinstance(expr, _expr.Var):
+                postfix = f"{name_sep}{expr.name_hint}"
+                source_name = source_name[: -len(postfix)]
+            return source_name
+        return None
+
+
+def _debug_rename(graph, use_parser_friendly_name=False):
+    import torch
+
+    renamed = set()
+
+    def _get_source_name(value):
+        # Example node.sourceRange():
+        # Serialized   File "code/__torch__.py", line 23
+        # def forward(self: __torch__.MyDecisionGate, argument_1: Tensor) -> Tensor:
+        #           return torch.neg(argument_1)
+        #                  ~~~~~~~~~ <--- HERE
+        indicator = "<--- HERE"
+        lines = value.node().sourceRange().splitlines()
+        source_name = "???"
+        for (idx, line) in enumerate(lines):
+            if line.find(indicator) != -1:
+                l, r = line.find("~"), line.rfind("~")
+                source_name = lines[idx - 1][l : r + 1]
+                break
+
+        return source_name.replace(".", "_") if use_parser_friendly_name else source_name
+
+    def _rename(value):
+        if value in renamed:
+            return
+
+        node = value.node()
+        if node.kind() in set(["prim::Param"]):
+            return
+
+        if node.kind() in set(["prim::ListConstruct", "prim::TupleConstruct"]):
+            assert (
+                str(value.type()) == "List[Tensor]"
+            ), f"Nested ListConstruct? Type string changed? {str(value.type)}"
+            for inp in node.inputs():
+                _rename(inp)
+            return
+
+        source_name = _get_source_name(value)
+        if not source_name.startswith("CONSTANTS.c"):
+            renamed.add(value)
+            value.setDebugName(source_name + "_" + str(len(renamed)))
+
+    for node in graph.nodes():
+        if node.kind() in set(["aten::t"]):
+            continue
+
+        try:
+            schema = torch._C.parse_schema(node.schema())
+
+            outputTensor = False
+            for out in schema.returns:
+                if str(out.type) in set(["Tensor"]):
+                    outputTensor = True
+                    break
+
+            if not outputTensor:
+                continue
+
+            for (idx, arg) in enumerate(schema.arguments):
+                if str(arg.type) in set(["Tensor", "Optional[Tensor]", "List[Tensor]"]):
+                    _rename(node.inputsAt(idx))
+
+            for (idx, out) in enumerate(schema.returns):
+                if str(out.type) in set(["Tensor"]):
+                    _rename(node.outputsAt(idx))
+        except RuntimeError:
+            # No schema
+            pass
 
 
 def _pytorch_result_type(dtypes, non_tensor_inputs):
@@ -4486,17 +4621,25 @@ def convert_params(graph, state_dict, use_parser_friendly_name=False):
 
             full_attr = _getattr_full_name(getattrs, attr_name_sep)
             full_attr_node_name = _get_output_name(getattrs[-1])
+            # set variable name by concatenating first consumer's name with full attribute
+            # e.g. "torch.batch_norm_5.running_mean"
+            var_name = attr_name_sep.join(
+                [
+                    _get_output_name(_get_users(getattrs[-1])[0]),
+                    full_attr.split(attr_name_sep)[-1],
+                ]
+            )
 
             if full_attr.endswith("_packed_params"):  # for quantized models
                 packed_param_map[full_attr_node_name] = full_attr
             elif full_attr in state_dict:
-                if full_attr in vars_by_name:
-                    var = vars_by_name[full_attr]
+                if var_name in vars_by_name:
+                    var = vars_by_name[var_name]
                 else:
                     torch_tensor = state_dict[full_attr]
-                    tensor, var = _get_tensor_and_var(torch_tensor, full_attr)
-                    param_tensors[full_attr] = tensor
-                    vars_by_name[full_attr] = var
+                    tensor, var = _get_tensor_and_var(torch_tensor, var_name)
+                    param_tensors[var_name] = tensor
+                    vars_by_name[var_name] = var
                 params[full_attr_node_name] = var
 
     return params, param_tensors, packed_param_map
@@ -4577,7 +4720,7 @@ def from_pytorch(
     prelude = Prelude(mod)
     enable_lower_all_tuples = True
 
-    converter = PyTorchOpConverter(prelude, default_dtype)
+    converter = PyTorchOpConverter(prelude, default_dtype, use_parser_friendly_name)
 
     graph = script_module.graph.copy()
 
@@ -4588,6 +4731,8 @@ def from_pytorch(
             enable_lower_all_tuples = False
             break
     _run_jit_passes(graph, enable_lower_all_tuples)
+
+    _debug_rename(graph, use_parser_friendly_name)
 
     if custom_convert_map:
         converter.update_convert_map(custom_convert_map)
