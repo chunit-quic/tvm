@@ -17,7 +17,7 @@
 
 import numpy as np
 
-from tvm import relay, testing
+from tvm import relay, testing, transform
 from tvm.relay.frontend.common import StrAttrsDict, set_span
 from relay.utils.tag_span import _set_span, _create_span, _verify_structural_equal_with_span
 
@@ -33,13 +33,13 @@ def test_key_is_not_present():
 
 
 class TestSetSpan:
-    def test_env_var_switch(self):
+    def test_pass_ctx_switch(self):
         def _res(should_fill):
             if should_fill:
-                with testing.enable_span_filling():
+                with transform.PassContext(config={"relay.frontend.fill_span": True}):
                     return set_span(relay.var("x", shape=(1, 64, 56, 56)), "x_var")
             else:
-                with testing.disable_span_filling():
+                with transform.PassContext(config={"relay.frontend.fill_span": False}):
                     return set_span(relay.var("x", shape=(1, 64, 56, 56)), "x_var")
 
         disable = relay.var("x", shape=(1, 64, 56, 56))
